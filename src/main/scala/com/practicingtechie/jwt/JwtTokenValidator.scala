@@ -3,16 +3,17 @@ package com.practicingtechie.jwt
 import java.security.cert.Certificate
 
 import cats.effect._
+import cats.effect.concurrent.Ref
 import org.http4s.client.Client
 import org.http4s.client.dsl.Http4sClientDsl
 
 case class TokenSigningCertificates(certificates: Map[String, Certificate])
 
-trait CertificateStore {
-  def getCertificateById(id: String): Either[String, Certificate]
+trait CertificateStore[F[_]] {
+  def getCertificateById(id: String): F[Either[String, Certificate]]
 }
 
-class HttpCertStore[F[_] : Effect : Timer](httpClient: Client[F]) extends CertificateStore with Http4sClientDsl[F] {
+class HttpCertStore[F[_] : Effect : Timer](httpClient: Client[F], d: Ref[F, TokenSigningCertificates]) extends CertificateStore[F] with Http4sClientDsl[F] {
   import java.security.cert.CertificateFactory
   import org.http4s.Uri
   import cats.implicits._
@@ -27,7 +28,9 @@ class HttpCertStore[F[_] : Effect : Timer](httpClient: Client[F]) extends Certif
   val certificateFactory = CertificateFactory.getInstance("X.509")
   val signingCertificateUpdateInterval = 2.seconds
 
-  Stream.awakeEvery[F](signingCertificateUpdateInterval).evalMap(_ => "".pure[F])
+  Stream.awakeEvery[F](signingCertificateUpdateInterval).evalMap { _ =>
+    loadCertificates(TokenVerificationCertificateUrls).flatMap(certs => d.set(certs))
+  }
 
   def loadCertificates(uris: List[Uri]) = {
     import cats.Traverse
@@ -54,8 +57,8 @@ class HttpCertStore[F[_] : Effect : Timer](httpClient: Client[F]) extends Certif
     implicit val stringMapDecoder: EntityDecoder[F, Map[String, String]] = jsonOf[F, Map[String, String]]
   }
 
-  override def getCertificateById(id: String): Either[String, Certificate] = {
-    ???
+  override def getCertificateById(id: String): F[Either[String, Certificate]] = {
+    d.get.map(s => Either.fromOption[String, Certificate](s.certificates.get(id), "cert not found"))
   }
 }
 
@@ -63,7 +66,7 @@ object HttpCertStore {
   def apply[F[_]]: F[HttpCertStore[F]] = ???
 }
 
-class JwtTokenValidator[F[_] : Sync](certificateStore: CertificateStore) {
+class JwtTokenValidator[F[_] : Sync](certificateStore : CertificateStore[F]) {
   import java.security.cert.CertificateFactory
   import cats.data.EitherT
   import cats.implicits._
@@ -74,17 +77,17 @@ class JwtTokenValidator[F[_] : Sync](certificateStore: CertificateStore) {
 
   val SupportedJwtAlgorithmNames = pdi.jwt.JwtAlgorithm.allRSA().map(_.name).toSet
 
-  def parseAndValidateToken(jwt: String): Either[String, JwtClaim] = {
+  def parseAndValidateToken(jwt: String): F[Either[String, JwtClaim]] = {
     val base64Header = jwt.split("\\.").headOption
 
     def base64Decode(s: String) = Either.catchNonFatal(java.util.Base64.getDecoder.decode(s))
       .map(new String(_))
       .leftMap(_.toString)
 
-    def getAlgorithmNameAndKeyId(hdr: Map[String, String]) = (for {
-      alg <- EitherT.fromOption[Id](hdr.get("alg"), "no alg")
-      kid <- EitherT.fromOption[Id](hdr.get("kid"), "no kid")
-    } yield alg -> kid).value
+    def getAlgorithmNameAndKeyId(hdr: Map[String, String]) = for {
+      alg <- EitherT.fromOptionF(hdr.get("alg").pure[F], "no alg")
+      kid <- EitherT.fromOptionF(hdr.get("kid").pure[F], "no kid")
+    } yield alg -> kid
 
     def getAlgorithm(algName: String) =
       if (SupportedJwtAlgorithmNames.contains(algName)) {
@@ -93,16 +96,16 @@ class JwtTokenValidator[F[_] : Sync](certificateStore: CertificateStore) {
         Left(s"unsupported algorithm $algName")
       }
 
-    for {
-      decoded <- base64Decode(base64Header.get)
-      jwtJson <- io.circe.jawn.parse(decoded).left.map(_.message)
-      jwtHeader <- jwtJson.as[Map[String, String]].left.map(_.message)
+    (for {
+      decoded <- EitherT.fromEither[F](base64Decode(base64Header.get))
+      jwtJson <- EitherT.fromEither[F](io.circe.jawn.parse(decoded).leftMap(_.message))
+      jwtHeader <- EitherT.fromEither[F](jwtJson.as[Map[String, String]].leftMap(_.message))
       algNameAndKid <- getAlgorithmNameAndKeyId(jwtHeader)
       (algName, kid) = algNameAndKid
-      algorithm <- getAlgorithm(algName)
-      certificate <- certificateStore.getCertificateById(kid)
-      token <- JwtCirce.decode(jwt, certificate.getPublicKey, Seq(algorithm)).toEither.leftMap(_.getMessage)
-    } yield token
+      algorithm <- EitherT.fromEither[F](getAlgorithm(algName))
+      certificate <- EitherT(certificateStore.getCertificateById(kid))
+      token <- EitherT.fromEither[F](JwtCirce.decode(jwt, certificate.getPublicKey, Seq(algorithm)).toEither.leftMap(_.getMessage))
+    } yield token).value
   }
 
 }
