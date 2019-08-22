@@ -6,6 +6,13 @@ import com.typesafe.scalalogging.Logger
 import java.security.cert.Certificate
 import org.http4s.client.Client
 
+import scala.concurrent.duration.FiniteDuration
+
+// TODO:
+// * remove println
+// * fix logging in trait
+// * test
+// * automated reload doesn't work
 
 case class TokenSigningCertificates(certificates: Map[String, Certificate])
 
@@ -48,9 +55,9 @@ class HttpCertStore[F[_] : Effect : Timer](d: Ref[F, TokenSigningCertificates], 
 
   val logger = Logger(this.getClass)
 
-  Stream.awakeEvery[F](signingCertificateUpdateInterval).evalMap { _ =>
+  def startRefresher = Stream.awakeEvery[F](signingCertificateUpdateInterval).evalMap { _ =>
     println("awoke")
-    loadCertificates(tokenVerificationCertificateUrls, httpClient).flatMap(certs => d.modify(old => certs -> old))
+    loadCertificates(tokenVerificationCertificateUrls, httpClient).flatMap(d.set)
   }
 
   override def getCertificateById(id: String): F[Either[String, Certificate]] = {
@@ -82,46 +89,24 @@ object HttpCertStore extends HttpCertStoreSupport {
 class JwtTokenValidator[F[_] : Sync](certificateStore : CertificateStore[F]) {
   import cats.data.EitherT
   import cats.implicits._
-  import pdi.jwt.JwtCirce
-  import pdi.jwt.algorithms
-  import pdi.jwt.JwtClaim
+  import pdi.jwt.{JwtAlgorithm, JwtCirce, JwtClaim, JwtOptions}
+  import pdi.jwt.algorithms.JwtRSAAlgorithm
 
   val logger = Logger(this.getClass)
 
-  val SupportedJwtAlgorithmNames = pdi.jwt.JwtAlgorithm.allRSA().map(_.name).toSet
+  val SupportedJwtAlgorithmNames = Seq(JwtAlgorithm.RS256).map(_.name).toSet
+  val headerParseOpts = JwtOptions.DEFAULT.copy(signature = false)
 
-  def parseAndValidateToken(jwt: String): F[Either[String, JwtClaim]] = {
-    val base64Header = jwt.split("\\.").headOption
-
-    def base64Decode(s: String) = Either.catchNonFatal(java.util.Base64.getDecoder.decode(s))
-      .map(new String(_))
-      .leftMap(_.toString)
-
-    def getAlgorithmNameAndKeyId(hdr: Map[String, String]) = for {
-      alg <- EitherT.fromOptionF(hdr.get("alg").pure[F], s"no alg: $hdr")
-      kid <- EitherT.fromOptionF(hdr.get("kid").pure[F], s"no kid: $hdr")
-    } yield alg -> kid
-
-    def getAlgorithm(algName: String) =
-      if (SupportedJwtAlgorithmNames.contains(algName)) {
-        Right(pdi.jwt.JwtAlgorithm.fromString(algName).asInstanceOf[algorithms.JwtRSAAlgorithm])
-      } else {
-        Left(s"unsupported algorithm $algName")
-      }
-
+  def parseAndValidateToken(jwt: String): F[Either[String, JwtClaim]] =
     (for {
-      decoded <- EitherT.fromEither[F](base64Decode(base64Header.get))
-      jwtJson <- EitherT.fromEither[F](io.circe.jawn.parse(decoded).leftMap(_.message))
-      jwtHeader <- EitherT.fromEither[F](jwtJson.as[Map[String, String]].leftMap(_.message))
-      algNameAndKid <- getAlgorithmNameAndKeyId(jwtHeader)
-      (algName, kid) = algNameAndKid
-      algorithm <- EitherT.fromEither[F](getAlgorithm(algName))
+      hdrClaimSig <- EitherT.fromEither[F](JwtCirce.decodeAll(jwt, headerParseOpts).toEither.leftMap(_.getMessage))
+      (jwtHeader, _, _) = hdrClaimSig
+      _ <- EitherT.right[String](println(jwtHeader.toJson).pure[F]) // TODO: remove
+      algo <- EitherT.fromOption[F](jwtHeader.algorithm, s"algorithm not specified: $jwtHeader")
+      algorithm <- EitherT.cond[F](SupportedJwtAlgorithmNames.contains(algo.name), algo.asInstanceOf[JwtRSAAlgorithm], s"unsupported algorithm $algo")
+      kid <- EitherT.fromOption[F](jwtHeader.keyId, s"keyId not specified: $jwtHeader")
       certificate <- EitherT(certificateStore.getCertificateById(kid))
       token <- EitherT.fromEither[F](JwtCirce.decode(jwt, certificate.getPublicKey, Seq(algorithm)).toEither.leftMap(_.getMessage))
-    } yield token).value.map { r =>
-      println(s"r: $r")
-      r
-    }
-  }
+    } yield token).value
 
 }
