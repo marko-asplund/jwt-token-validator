@@ -22,7 +22,7 @@ val logBackV = "1.2.3"
 val http4sV = "0.20.10"
 val circeV = "0.11.1"
 val specs2V = "4.6.0"
-val jwtV = "3.0.0"
+val jwtV = "4.0.0"
 
 
 libraryDependencies ++= Seq(

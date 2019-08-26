@@ -3,24 +3,21 @@ package com.practicingtechie.jwt
 import cats.effect._
 import cats.effect.concurrent.Ref
 import com.typesafe.scalalogging.Logger
-import java.security.cert.Certificate
+import java.security.cert.X509Certificate
 import org.http4s.client.Client
 
-import scala.concurrent.duration.FiniteDuration
 
-// TODO:
-// * remove println
-// * fix logging in trait
-// * test
-// * automated reload doesn't work
-
-case class TokenSigningCertificates(certificates: Map[String, Certificate])
+case class TokenSigningCertificates(certificates: Map[String, X509Certificate])
 
 trait CertificateStore[F[_]] {
-  def getCertificateById(id: String): F[Either[String, Certificate]]
+  def getCertificateById(id: String): F[Either[String, X509Certificate]]
+  def startCertUpdaterStream: fs2.Stream[F, Unit]
 }
 
+
 trait HttpCertStoreSupport {
+  self: { def logger: Logger } =>
+
   import org.http4s.Uri
 
   def loadCertificates[F[_] : Effect](uris: List[Uri], httpClient: Client[F]): F[TokenSigningCertificates] = {
@@ -29,12 +26,11 @@ trait HttpCertStoreSupport {
     import org.http4s.circe._
     import HttpCertStore.certificateFactory
 
-    //logger.debug("loading certs")
-    println("loading certs")
+    logger.debug("loading certificates")
     implicit val stringMapDecoder: EntityDecoder[F, Map[String, String]] = jsonOf[F, Map[String, String]]
 
     def convertCertificateFromPem(pem: String) =
-      Either.catchNonFatal(certificateFactory.generateCertificate(new java.io.ByteArrayInputStream(pem.getBytes)))
+      Either.catchNonFatal(certificateFactory.generateCertificate(new java.io.ByteArrayInputStream(pem.getBytes)).asInstanceOf[X509Certificate])
         .leftMap(_.getMessage)
 
     uris.traverse { uri =>
@@ -55,13 +51,21 @@ class HttpCertStore[F[_] : Effect : Timer](d: Ref[F, TokenSigningCertificates], 
 
   val logger = Logger(this.getClass)
 
-  def startRefresher = Stream.awakeEvery[F](signingCertificateUpdateInterval).evalMap { _ =>
-    println("awoke")
-    loadCertificates(tokenVerificationCertificateUrls, httpClient).flatMap(d.set)
+  def startCertUpdaterStream = Stream.awakeEvery[F](signingCertificateUpdateInterval).evalMap { _ =>
+    logger.debug("refreshing certificates")
+    loadCertificates(tokenVerificationCertificateUrls, httpClient).flatMap { certs =>
+      d.modify { old =>
+        val now = java.time.Instant.now
+        val validCerts = old.certificates.filter{ case (_, cert) => now.isBefore(cert.getNotAfter.toInstant) }
+        val newCerts = TokenSigningCertificates(certs.certificates ++ validCerts)
+        logger.debug(s"stats: old: ${old.certificates.size}; valid old: ${validCerts.size}; new: ${newCerts.certificates.size}")
+        newCerts -> old
+      }.map(_ => ())
+    }
   }
 
-  override def getCertificateById(id: String): F[Either[String, Certificate]] = {
-    d.get.map(s => Either.fromOption[String, Certificate](s.certificates.get(id), s"cert $id not found"))
+  override def getCertificateById(id: String): F[Either[String, X509Certificate]] = {
+    d.get.map(s => Either.fromOption[String, X509Certificate](s.certificates.get(id), s"cert $id not found"))
   }
 }
 
@@ -101,7 +105,6 @@ class JwtTokenValidator[F[_] : Sync](certificateStore : CertificateStore[F]) {
     (for {
       hdrClaimSig <- EitherT.fromEither[F](JwtCirce.decodeAll(jwt, headerParseOpts).toEither.leftMap(_.getMessage))
       (jwtHeader, _, _) = hdrClaimSig
-      _ <- EitherT.right[String](println(jwtHeader.toJson).pure[F]) // TODO: remove
       algo <- EitherT.fromOption[F](jwtHeader.algorithm, s"algorithm not specified: $jwtHeader")
       algorithm <- EitherT.cond[F](SupportedJwtAlgorithmNames.contains(algo.name), algo.asInstanceOf[JwtRSAAlgorithm], s"unsupported algorithm $algo")
       kid <- EitherT.fromOption[F](jwtHeader.keyId, s"keyId not specified: $jwtHeader")

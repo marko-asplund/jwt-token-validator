@@ -8,6 +8,7 @@ object Main extends IOApp {
   import scala.concurrent.ExecutionContext.global
   import cats.implicits._
   import fs2.Stream
+  val token = "xyz"
 
   def run(args: List[String]): IO[ExitCode] =
     (for {
@@ -15,12 +16,7 @@ object Main extends IOApp {
       store <- Stream.eval(HttpCertStore[IO](client))
       validator <- Stream.eval(new JwtTokenValidator[IO](store).pure[IO])
       res <- Stream.eval(validator.parseAndValidateToken(token))
-    } yield res match {
-      case r @ Right(c) =>
-        println(c.toJson)
-        r
-      case r =>
-        println(r)
-        r
-    }).compile.drain.as(ExitCode.Success)
+      _ <- Stream.eval(IO.delay(println(s"res: $res")))
+      _ <- Stream.never[IO].concurrently(store.startCertUpdaterStream)
+    } yield res).compile.drain.as(ExitCode.Success)
 }
